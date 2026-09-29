@@ -1,9 +1,11 @@
 #include <M5Unified.h>
-#include <BleKeyboard.h>
+#include <BLEDevice.h>
+#include <BLEAdvertising.h>
 #include <vector>
-#include <Arduino.h>
 
-BleKeyboard bleKeyboard("M5key", "M5Stack", 100);
+BLEAdvertising *pAdvertising;
+uint8_t seqCounter = 0;
+
 M5Canvas canvas(&M5.Display);
 
 #define THEME_BG TFT_BLACK
@@ -19,6 +21,8 @@ MenuState currentMenu = MAIN_MENU;
 int selectedIndex = 0;
 bool isRecording = false;
 bool isComboRecording = false;
+bool showSignal = false;
+uint32_t signalTime = 0;
 
 struct Action {
   MenuState menu;
@@ -36,7 +40,7 @@ const char* mainItems[] = {"Media Cmds", "Klavye"};
 const char* mediaItems[] = {"Ekran Fotosu", "Ses Arttir", "Ses Azalt", "Sustur", "Ses Fulle", "Oynat/Duraklat", "Sonraki", "Onceki"};
 const char* kbMainItems[] = {"Harfler", "Modifiers", "Navigation", "Ozel Tuslar", "Function", "Kombinasyon", "Sira (Makro)"};
 const char* kbLetters[] = {"A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","0","1","2","3","4","5","6","7","8","9"};
-const char* kbModifiers[] = {"Ctrl", "Shift", "Alt", "GUI (Win/Cmd)", "Fn"};
+const char* kbModifiers[] = {"Ctrl", "Shift", "Alt", "GUI (Win/Cmd)"}; // Fn çıkarıldı (Python karşılığı yok)
 const char* kbNav[] = {"Yukari Ok", "Asagi Ok", "Sol Ok", "Sag Ok", "Home", "End", "Page Up", "Page Down", "Delete"};
 const char* kbSpecial[] = {"Enter", "Tab", "Esc", "Space", "Backspace", "Capslock", "Print Screen", "Pause", "Menu"};
 const char* kbFunc[] = {"F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12","F13","F14","F15","F16","F17","F18","F19","F20","F21","F22","F23","F24"};
@@ -49,14 +53,49 @@ int b_clicks = 0;
 bool b_handled = false;
 uint32_t a_last_exec = 0;
 
-bool lastBleState = false;
-uint32_t lastAutoRefresh = 0;
-
-// Fonksiyon Prototipleri
 void drawUI();
 void showToast(const char* msg);
-void triggerKey(MenuState menu, int index);
+void triggerAction(MenuState menu, int index);
 void goBack();
+
+uint16_t getCommandCode(MenuState menu, int index) {
+  switch (menu) {
+    case MEDIA_MENU:   return 100 + index;
+    case KB_LETTERS:   return 200 + index;
+    case KB_SPECIAL:   return 300 + index;
+    case KB_NAV:       return 400 + index;
+    case KB_MODIFIERS: return 500 + index;
+    case KB_FUNC:      return 600 + index;
+    default: return 0;
+  }
+}
+
+// Beacon Paketi Gönderici (Tek veya Çoklu Tuş Desteği)
+void sendBleBeacon(std::vector<uint16_t> cmds) {
+  seqCounter++;
+  
+  std::string payload = "";
+  payload += (char)0xFF; // M5Stack ID Low
+  payload += (char)0xFF; // M5Stack ID High
+  payload += (char)seqCounter;
+  payload += (char)cmds.size(); // Kaç tuş basılacak (Kombinasyon için)
+
+  for(int i=0; i<cmds.size(); i++) {
+    payload += (char)(cmds[i] & 0xFF);
+    payload += (char)((cmds[i] >> 8) & 0xFF);
+  }
+
+  BLEAdvertisementData oData;
+  oData.setName("M5Key_Beacon");
+  oData.setManufacturerData(payload);
+
+  pAdvertising->stop();
+  pAdvertising->setAdvertisementData(oData);
+  pAdvertising->start();
+
+  showSignal = true;
+  signalTime = millis();
+}
 
 void setup() {
   auto cfg = M5.config();
@@ -73,8 +112,8 @@ void setup() {
   comboNames.push_back("Ctrl + Z (Geri)");comboActions.push_back({{KB_MODIFIERS, 0}, {KB_LETTERS, 25}});
   comboNames.push_back("Win + D (Masa)"); comboActions.push_back({{KB_MODIFIERS, 3}, {KB_LETTERS, 3}});
   
-  bleKeyboard.begin();
-  bleKeyboard.setBatteryLevel(M5.Power.getBatteryLevel());
+  BLEDevice::init("M5Key_Beacon");
+  pAdvertising = BLEDevice::getAdvertising();
   
   drawUI();
 }
@@ -82,25 +121,24 @@ void setup() {
 void loop() {
   M5.update();
   handleButtons();
-  
-  bool currentBleState = bleKeyboard.isConnected();
-  if (currentBleState != lastBleState || (millis() - lastAutoRefresh > 2000)) {
-    lastBleState = currentBleState;
-    lastAutoRefresh = millis();
-    if (currentBleState) bleKeyboard.setBatteryLevel(M5.Power.getBatteryLevel());
+
+  // Sinyal yazısını 300ms sonra normale döndür
+  if (showSignal && (millis() - signalTime > 300)) {
+    showSignal = false;
     drawUI();
   }
+  
+  delay(10);
 }
 
 void handleButtons() {
-  // BUTON B (YAN BUTON) - Tek Tık: Aşağı, Çift Tık: Yukarı, Basılı Tutma: Geri
   if (M5.BtnB.wasPressed()) {
     b_press_time = millis();
     b_handled = false;
   }
   
   if (M5.BtnB.isPressed() && !b_handled && (millis() - b_press_time > 400)) {
-    goBack(); // Basılı tutulunca önceki menüye döner
+    goBack(); 
     drawUI();
     b_handled = true;
   }
@@ -111,11 +149,11 @@ void handleButtons() {
   }
   
   if (b_clicks > 0 && (millis() - b_last_click > 250)) {
-    if (b_clicks == 1) { // Tek Tık -> Sonraki / Aşağı
+    if (b_clicks == 1) { 
       selectedIndex++;
       if (selectedIndex >= getMenuSize(currentMenu)) selectedIndex = 0;
       drawUI();
-    } else if (b_clicks >= 2) { // Çift Tık -> Önceki / Yukarı
+    } else if (b_clicks >= 2) { 
       selectedIndex--;
       if (selectedIndex < 0) selectedIndex = getMenuSize(currentMenu) - 1;
       drawUI();
@@ -123,13 +161,12 @@ void handleButtons() {
     b_clicks = 0;
   }
 
-  // BUTON A (ANA BUTON)
   if (M5.BtnA.wasPressed()) {
-    executeAction(currentMenu, selectedIndex);
+    triggerAction(currentMenu, selectedIndex);
     a_last_exec = millis();
     drawUI();
   } else if (M5.BtnA.isPressed() && (millis() - a_last_exec > 500)) {
-    executeAction(currentMenu, selectedIndex);
+    triggerAction(currentMenu, selectedIndex);
     a_last_exec = millis();
   }
 }
@@ -140,11 +177,11 @@ int getMenuSize(MenuState state) {
     case MEDIA_MENU: return 8;
     case KB_MAIN: return 7;
     case KB_LETTERS: return 36;
-    case KB_MODIFIERS: return 5;
+    case KB_MODIFIERS: return 4;
     case KB_NAV: return 9;
     case KB_SPECIAL: return 9;
     case KB_FUNC: return 24;
-    case KB_COMBO: return 1 + comboNames.size(); // 1 adet Ekleme butonu + Kombinasyonlar
+    case KB_COMBO: return 1 + comboNames.size(); 
     case KB_SEQUENCE: return 4;
   }
   return 0;
@@ -175,7 +212,6 @@ void goBack() {
   selectedIndex = 0;
 }
 
-// Kısa Ekranda Beliren Uyarı Fonksiyonu
 void showToast(const char* msg) {
   canvas.fillRoundRect(20, 45, 200, 35, 5, TFT_DARKGREEN);
   canvas.setTextColor(TFT_WHITE, TFT_DARKGREEN);
@@ -183,64 +219,11 @@ void showToast(const char* msg) {
   canvas.setCursor(40, 55); 
   canvas.print(msg);
   canvas.pushSprite(0, 0);
-  delay(300); // 0.3 sn ekranda kalır
+  delay(300);
   drawUI();
 }
 
-// Sadece tuşa basma/yazma işlemi yapar (Release etmez)
-void triggerKey(MenuState menu, int index) {
-  switch (menu) {
-    case MEDIA_MENU:
-      if (index == 0) bleKeyboard.write(KEY_PRTSC);
-      else if (index == 1) bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
-      else if (index == 2) bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
-      else if (index == 3) bleKeyboard.write(KEY_MEDIA_MUTE);
-      else if (index == 4) { for (int i=0; i<50; i++) bleKeyboard.write(KEY_MEDIA_VOLUME_UP); }
-      else if (index == 5) bleKeyboard.write(KEY_MEDIA_PLAY_PAUSE);
-      else if (index == 6) bleKeyboard.write(KEY_MEDIA_NEXT_TRACK);
-      else if (index == 7) bleKeyboard.write(KEY_MEDIA_PREVIOUS_TRACK);
-      break;
-    case KB_LETTERS:
-      if (index < 26) bleKeyboard.print((char)('a' + index));
-      else bleKeyboard.print((char)('0' + (index - 26)));
-      break;
-    case KB_MODIFIERS:
-      if (index == 0) bleKeyboard.press(KEY_LEFT_CTRL);
-      if (index == 1) bleKeyboard.press(KEY_LEFT_SHIFT);
-      if (index == 2) bleKeyboard.press(KEY_LEFT_ALT);
-      if (index == 3) bleKeyboard.press(KEY_LEFT_GUI);
-      break;
-    case KB_NAV:
-      if (index == 0) bleKeyboard.write(KEY_UP_ARROW);
-      if (index == 1) bleKeyboard.write(KEY_DOWN_ARROW);
-      if (index == 2) bleKeyboard.write(KEY_LEFT_ARROW);
-      if (index == 3) bleKeyboard.write(KEY_RIGHT_ARROW);
-      if (index == 4) bleKeyboard.write(KEY_HOME);
-      if (index == 5) bleKeyboard.write(KEY_END);
-      if (index == 6) bleKeyboard.write(KEY_PAGE_UP);
-      if (index == 7) bleKeyboard.write(KEY_PAGE_DOWN);
-      if (index == 8) bleKeyboard.write(KEY_DELETE);
-      break;
-    case KB_SPECIAL:
-      if (index == 0) bleKeyboard.write(KEY_RETURN);
-      if (index == 1) bleKeyboard.write(KEY_TAB);
-      if (index == 2) bleKeyboard.write(KEY_ESC);
-      if (index == 3) bleKeyboard.write(' ');
-      if (index == 4) bleKeyboard.write(KEY_BACKSPACE);
-      if (index == 5) bleKeyboard.write(KEY_CAPS_LOCK);
-      if (index == 6) bleKeyboard.write(KEY_PRTSC);
-      if (index == 7) bleKeyboard.write(0x48);
-      if (index == 8) bleKeyboard.write(0xED);
-      break;
-    case KB_FUNC:
-      bleKeyboard.write(KEY_F1 + index);
-      break;
-  }
-}
-
-void executeAction(MenuState menu, int index) {
-  if (!bleKeyboard.isConnected() && menu != MAIN_MENU && menu != KB_MAIN && menu != KB_SEQUENCE && menu != KB_COMBO) return;
-
+void triggerAction(MenuState menu, int index) {
   // SIRA (MAKRO) KAYDEDİLİYORSA
   if (isRecording && menu != MAIN_MENU && menu != KB_MAIN && menu != KB_SEQUENCE) {
     sequence.push_back({menu, index});
@@ -266,7 +249,7 @@ void executeAction(MenuState menu, int index) {
     selectedIndex = 0;
   } 
   else if (menu == KB_COMBO) {
-    if (index == 0) { // Kombinasyon Ekle / Kaydet Butonu
+    if (index == 0) {
       if (!isComboRecording) {
         isComboRecording = true;
         tempCombo.clear();
@@ -274,15 +257,16 @@ void executeAction(MenuState menu, int index) {
         isComboRecording = false;
         if (tempCombo.size() > 0) {
           comboActions.push_back(tempCombo);
-          comboNames.push_back("Ozel Komb " + String(comboNames.size() - 5)); // Özel adlandırma
+          comboNames.push_back("Ozel Komb " + String(comboNames.size() - 5));
         }
       }
-    } else { // Kayıtlı Kombinasyonu Çalıştır
+    } else {
+      // Kombinasyonu Tek Pakette Fırlat (PyAutoGUI Hotkey algılayacak)
+      std::vector<uint16_t> comboCmds;
       for (auto const& action : comboActions[index - 1]) {
-        triggerKey(action.menu, action.index);
-        delay(20);
+        comboCmds.push_back(getCommandCode(action.menu, action.index));
       }
-      bleKeyboard.releaseAll(); // Tüm tuşları aynı anda bırak
+      sendBleBeacon(comboCmds);
     }
   } 
   else if (menu == KB_SEQUENCE) {
@@ -290,9 +274,8 @@ void executeAction(MenuState menu, int index) {
       bool wasRec = isRecording;
       isRecording = false;
       for (auto const& action : sequence) {
-        triggerKey(action.menu, action.index);
-        delay(100);
-        bleKeyboard.releaseAll();
+        sendBleBeacon({getCommandCode(action.menu, action.index)});
+        delay(150); // Python'un ardışık tuşları kaçırmaması için kısa bekleme
       }
       isRecording = wasRec;
     }
@@ -301,35 +284,30 @@ void executeAction(MenuState menu, int index) {
     else if (index == 3) { sequence.clear(); }
   } 
   else {
-    // Normal Tuş Basımı
-    triggerKey(menu, index);
-    if (!isRecording && !isComboRecording) {
-      bleKeyboard.releaseAll();
-    }
+    // Normal Tek Tuş Gönderimi
+    sendBleBeacon({getCommandCode(menu, index)});
   }
 }
 
 void drawUI() {
   canvas.fillScreen(THEME_BG);
   
-  // Üst Bar
   canvas.setTextSize(1.5);
   canvas.setTextColor(THEME_FG, THEME_BG);
   canvas.setCursor(5, 5);
-  canvas.print("M5key");
+  canvas.print("MKey"); // Yazı MKey olarak güncellendi
   
-  // Pil Seviyesi
   canvas.setCursor(185, 5);
   canvas.printf("%%%d", M5.Power.getBatteryLevel());
   
-  // BLE ve Kayıt Durumu (Ortada)
-  canvas.setCursor(80, 5);
-  if (bleKeyboard.isConnected()) {
-    canvas.setTextColor(TFT_GREEN, THEME_BG);
-    canvas.print("[BLE OK]");
+  // Sinyal ve Yayın Durumu
+  canvas.setCursor(75, 5);
+  if (showSignal) {
+    canvas.setTextColor(TFT_YELLOW, THEME_BG);
+    canvas.print("[SINYAL!]");
   } else {
-    canvas.setTextColor(TFT_RED, THEME_BG);
-    canvas.print("[KOPUK]");
+    canvas.setTextColor(TFT_GREEN, THEME_BG);
+    canvas.print("[YAYINDA]");
   }
   
   if (isRecording || isComboRecording) {
@@ -340,9 +318,8 @@ void drawUI() {
 
   canvas.drawLine(0, 20, 240, 20, THEME_FG);
 
-  // Menü Çizimi
   canvas.setTextSize(2);
-  int visibleItems = (currentMenu == KB_SEQUENCE && sequence.size() > 0) ? 3 : 4; // Makro listesi varsa 3 satır göster
+  int visibleItems = (currentMenu == KB_SEQUENCE && sequence.size() > 0) ? 3 : 4; 
   int startIdx = (selectedIndex / visibleItems) * visibleItems;
   int listSize = getMenuSize(currentMenu);
   
@@ -362,17 +339,16 @@ void drawUI() {
     canvas.print(getMenuItem(currentMenu, itemIdx));
   }
 
-  // Sıra Menüsündeyken Makroları Alt Kısımda Göster
   if (currentMenu == KB_SEQUENCE && sequence.size() > 0) {
     canvas.setTextSize(1.5);
     canvas.setTextColor(TFT_ORANGE, THEME_BG);
-    canvas.setCursor(5, 115); // Ekranın en altına hizala
+    canvas.setCursor(5, 115); 
     String seqText = "Sira: ";
     for (int i = 0; i < sequence.size(); i++) {
       seqText += getMenuItem(sequence[i].menu, sequence[i].index);
       if (i < sequence.size() - 1) seqText += ", ";
     }
-    canvas.print(seqText); // Uzun olursa ekranın dışına taşar (M5Canvas otomatik kırpar)
+    canvas.print(seqText); 
   }
   
   canvas.pushSprite(0, 0);
