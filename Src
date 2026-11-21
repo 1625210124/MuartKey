@@ -1,9 +1,12 @@
 #include <M5Unified.h>
 #include <BLEDevice.h>
 #include <BLEAdvertising.h>
+#include <Preferences.h>
+#include <math.h>
 #include <vector>
 
 BLEAdvertising *pAdvertising;
+Preferences prefs;
 uint8_t seqCounter = 0;
 
 M5Canvas canvas(&M5.Display);
@@ -11,53 +14,114 @@ M5Canvas canvas(&M5.Display);
 #define THEME_BG TFT_BLACK
 #define THEME_FG TFT_BLUE
 #define THEME_SEL TFT_WHITE
+#define ARRAY_LEN(a) ((int)(sizeof(a) / sizeof((a)[0])))
+
+// ------------------------------------------------------------
+// KEYPAD (8 pinli 4x4) - satir pinleri fiziksel sirayla: G7 G6 G4 G5, sutunlar: G43 G44 G2 G3
+//   Kucuk = onceki kablolama  (S = satir*4 + sutun)
+//   Buyuk = yeni kablolama    (S = sutun*4 + satir, yani ters cevrilmis)
+// ------------------------------------------------------------
+const int ROW_PINS[4] = {7, 6, 4, 5};
+const int COL_PINS[4] = {43, 44, 2, 3};
+
+// ------------------------------------------------------------
+// JOYSTICK
+//   Buyuk: SW=G0, VRY=G1, VRX=G8
+//   Kucuk: SW=G8, VRY=G1, VRX=G0   (ESP32-S3'te G0 ADC pini DEGIL -> X ekseni okunamaz)
+// ------------------------------------------------------------
+const int JOY_PIN_Y = 1;
+const bool JOY_INVERT_X = false;   // X yonu ters cikarsa true yap
+const bool JOY_INVERT_Y = false;   // Y yonu ters cikarsa true yap
+const float JOY_DEADZONE = 0.15f;
+const uint32_t JOY_MIN_SEND_MS = 50;    // degisimde en sik gonderim
+const uint32_t JOY_KEEPALIVE_MS = 150;  // basili tutarken tekrar
+
+// Limitler (BLE reklam paketi 31 bayt ile sinirli -> en fazla 4 tus / kombinasyon)
+const int MAX_KEYS = 4;
+const int MAX_COMBOS = 40;
+const int MAX_SEQ = 80;
 
 enum MenuState {
   MAIN_MENU, MEDIA_MENU, KB_MAIN, KB_LETTERS, KB_MODIFIERS,
-  KB_NAV, KB_SPECIAL, KB_FUNC, KB_COMBO, KB_SEQUENCE
+  KB_NAV, KB_SPECIAL, KB_FUNC, KB_COMBO, KB_SEQUENCE,
+  KP_MAIN, KP_SETTINGS, KP_PLAY,
+  JOY_MAIN, JOY_ACTION, JOY_ROTATE
 };
+
+enum JoyMode { JM_OFF = 0, JM_BOTH = 1, JM_ONLY = 2 };
+enum JoyAction { JA_WASD = 0, JA_ARROWS = 1, JA_ANALOG = 2, JA_MOUSE = 3 };
 
 MenuState currentMenu = MAIN_MENU;
 int selectedIndex = 0;
-bool isRecording = false;
-bool isComboRecording = false;
+bool isRecording = false;       // sira (makro) kaydi
+bool isComboRecording = false;  // yeni kombinasyon kaydi
+int assignTarget = -1;          // keypad atamasi: 0..15 = S1..S16, -1 = kapali
 bool showSignal = false;
 uint32_t signalTime = 0;
 
-struct Action {
-  MenuState menu;
-  int index;
-};
-std::vector<Action> sequence;
+// Kalici ayarlar
+bool kpBig = true;              // keypad boyutu (Buyuk = yeni kablolama)
+uint8_t joyMode = JM_OFF;       // Kapali / Klavye Birlikte / Sadece Joystick
+bool joyBig = true;             // Sadece Joystick modundaki kablolama
+uint8_t joyAction = JA_WASD;    // joystick ne yapacak
+uint8_t joyOrient = 0;          // ileri yonu: 0 yukari, 1 asagi, 2 sag, 3 sol
 
-// Dinamik Kombinasyon Listeleri
-std::vector<String> comboNames;
-std::vector<std::vector<Action>> comboActions;
-std::vector<Action> tempCombo;
+// Bir "adim" = 1 veya daha fazla tus kodu (kombinasyon ise birden fazla)
+typedef std::vector<uint16_t> Keys;
+std::vector<Keys> sequence;   // makro sirasi
+std::vector<Keys> combos;     // kombinasyon listesi
+Keys tempCombo;               // kaydedilmekte olan kombinasyon
+Keys bindings[16];            // S1..S16 atamalari
 
-// Menü İçerikleri
-const char* mainItems[] = {"Media Cmds", "Klavye"};
+// Menu icerikleri
+const char* mainItems[] = {"Media Cmds", "Klavye", "Keypad", "Joystick"};
+const char* kpMainItems[] = {"Ayarlar", "Klavye"};
+const char* joyModeNames[] = {"Kapali", "Klavye Birlikte", "Sadece Joystick"};
+const char* joyActionNames[] = {"WASD", "Ok Tuslari", "Analog (Gamepad)", "Mouse"};
+const char* dirNames[] = {"Yukari", "Asagi", "Sag", "Sol"};
 const char* mediaItems[] = {"Ekran Fotosu", "Ses Arttir", "Ses Azalt", "Sustur", "Ses Fulle", "Oynat/Duraklat", "Sonraki", "Onceki"};
 const char* kbMainItems[] = {"Harfler", "Modifiers", "Navigation", "Ozel Tuslar", "Function", "Kombinasyon", "Sira (Makro)"};
 const char* kbLetters[] = {"A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","0","1","2","3","4","5","6","7","8","9"};
-const char* kbModifiers[] = {"Ctrl", "Shift", "Alt", "GUI (Win/Cmd)"}; // Fn çıkarıldı (Python karşılığı yok)
+const char* kbModifiers[] = {"Ctrl", "Shift", "Alt", "GUI (Win/Cmd)"};
 const char* kbNav[] = {"Yukari Ok", "Asagi Ok", "Sol Ok", "Sag Ok", "Home", "End", "Page Up", "Page Down", "Delete"};
 const char* kbSpecial[] = {"Enter", "Tab", "Esc", "Space", "Backspace", "Capslock", "Print Screen", "Pause", "Menu"};
 const char* kbFunc[] = {"F1","F2","F3","F4","F5","F6","F7","F8","F9","F10","F11","F12","F13","F14","F15","F16","F17","F18","F19","F20","F21","F22","F23","F24"};
 const char* kbSequence[] = {"Sirayi Gonder", "Kayda Basla", "Kaydi Bitir", "Sirayi Temizle"};
 
-// Buton Zamanlayıcıları
+// Buton zamanlayicilari
 uint32_t b_press_time = 0;
 uint32_t b_last_click = 0;
 int b_clicks = 0;
 bool b_handled = false;
 uint32_t a_last_exec = 0;
+uint32_t a_repeat_ms = 500;
+MenuState a_menu = MAIN_MENU;
 
+// Prototipler
 void drawUI();
-void showToast(const char* msg);
+void showToast(const String& msg);
 void triggerAction(MenuState menu, int index);
 void goBack();
+void handleButtons();
+void handleKeypad();
+void handleJoystick();
+int getMenuSize(MenuState state);
+String getMenuItem(MenuState state, int index);
 
+// ------------------------------------------------------------
+// Efektif (gecerli) kablolama / durum
+// ------------------------------------------------------------
+bool keypadActive()  { return joyMode != JM_ONLY; }                 // Sadece Joystick: keypad kapali
+bool kpBigEff()      { return joyMode == JM_BOTH ? true : kpBig; }  // Birlikte: Buyuk sabit
+bool joyActive()     { return joyMode != JM_OFF; }
+bool joyBigEff()     { return joyMode == JM_BOTH ? true : joyBig; }
+int  joySwPin()      { return joyBigEff() ? 0 : 8; }
+int  joyXPin()       { return joyBigEff() ? 8 : 0; }
+bool joyAdcOk(int pin) { return pin >= 1 && pin <= 20; }            // ESP32-S3 ADC pinleri
+
+// ------------------------------------------------------------
+// Tus kodlari ve etiketleri
+// ------------------------------------------------------------
 uint16_t getCommandCode(MenuState menu, int index) {
   switch (menu) {
     case MEDIA_MENU:   return 100 + index;
@@ -70,21 +134,143 @@ uint16_t getCommandCode(MenuState menu, int index) {
   }
 }
 
-// Beacon Paketi Gönderici (Tek veya Çoklu Tuş Desteği)
-void sendBleBeacon(std::vector<uint16_t> cmds) {
-  seqCounter++;
-  
-  std::string payload = "";
-  payload += (char)0xFF; // M5Stack ID Low
-  payload += (char)0xFF; // M5Stack ID High
-  payload += (char)seqCounter;
-  payload += (char)cmds.size(); // Kaç tuş basılacak (Kombinasyon için)
-
-  for(int i=0; i<cmds.size(); i++) {
-    payload += (char)(cmds[i] & 0xFF);
-    payload += (char)((cmds[i] >> 8) & 0xFF);
+String codeLabel(uint16_t code) {
+  int group = code / 100;
+  int idx = code % 100;
+  switch (group) {
+    case 1: if (idx < ARRAY_LEN(mediaItems))  return mediaItems[idx]; break;
+    case 2: if (idx < ARRAY_LEN(kbLetters))   return kbLetters[idx]; break;
+    case 3: if (idx < ARRAY_LEN(kbSpecial))   return kbSpecial[idx]; break;
+    case 4: if (idx < ARRAY_LEN(kbNav))       return kbNav[idx]; break;
+    case 5: if (code == 503) return "Win";
+            if (idx < ARRAY_LEN(kbModifiers)) return kbModifiers[idx]; break;
+    case 6: if (idx < ARRAY_LEN(kbFunc))      return kbFunc[idx]; break;
   }
+  return "?";
+}
 
+// Kisayolun adi: "Ctrl+C", "Alt+F4", "Enter" ...
+String keysLabel(const Keys& k) {
+  String s = "";
+  for (size_t i = 0; i < k.size(); i++) {
+    if (i) s += "+";
+    s += codeLabel(k[i]);
+  }
+  return s;
+}
+
+String bindingLabel(int i) {
+  return bindings[i].empty() ? String("Yok") : keysLabel(bindings[i]);
+}
+
+// Menudeki bir ogenin gonderecegi tuslar (yapisal ogeler icin bos doner)
+Keys keysForItem(MenuState menu, int index) {
+  Keys k;
+  if (menu == KB_COMBO) {
+    if (index >= 1 && index <= (int)combos.size()) k = combos[index - 1];
+  } else {
+    uint16_t code = getCommandCode(menu, index);
+    if (code) k.push_back(code);
+  }
+  return k;
+}
+
+// ------------------------------------------------------------
+// Kalici hafiza (NVS)
+// ------------------------------------------------------------
+std::vector<uint8_t> packList(const std::vector<Keys>& list) {
+  std::vector<uint8_t> out;
+  for (const Keys& k : list) {
+    out.push_back((uint8_t)k.size());
+    for (uint16_t c : k) {
+      out.push_back(c & 0xFF);
+      out.push_back((c >> 8) & 0xFF);
+    }
+  }
+  return out;
+}
+
+std::vector<Keys> unpackList(const uint8_t* d, size_t len) {
+  std::vector<Keys> list;
+  size_t i = 0;
+  while (i < len) {
+    uint8_t n = d[i++];
+    if (n > MAX_KEYS || i + (size_t)n * 2 > len) break;
+    Keys k;
+    for (uint8_t j = 0; j < n; j++) {
+      k.push_back((uint16_t)(d[i] | (d[i + 1] << 8)));
+      i += 2;
+    }
+    list.push_back(k);
+  }
+  return list;
+}
+
+void saveList(const char* key, const std::vector<Keys>& list) {
+  std::vector<uint8_t> buf = packList(list);
+  prefs.begin("mkey", false);
+  if (buf.empty()) prefs.remove(key);
+  else prefs.putBytes(key, buf.data(), buf.size());
+  prefs.end();
+}
+
+bool loadList(const char* key, std::vector<Keys>& out) {
+  prefs.begin("mkey", false);
+  size_t len = prefs.getBytesLength(key);
+  bool ok = len > 0;
+  if (ok) {
+    std::vector<uint8_t> buf(len);
+    prefs.getBytes(key, buf.data(), len);
+    out = unpackList(buf.data(), len);
+  }
+  prefs.end();
+  return ok;
+}
+
+void saveBindings() {
+  saveList("binds", std::vector<Keys>(bindings, bindings + 16));
+}
+
+void loadBindings() {
+  std::vector<Keys> l;
+  if (loadList("binds", l)) {
+    for (int i = 0; i < 16 && i < (int)l.size(); i++) bindings[i] = l[i];
+  }
+}
+
+void loadDefaultCombos() {
+  combos.clear();
+  combos.push_back({502, 603});  // Alt + F4
+  combos.push_back({502, 301});  // Alt + Tab
+  combos.push_back({500, 202});  // Ctrl + C
+  combos.push_back({500, 221});  // Ctrl + V
+  combos.push_back({500, 225});  // Ctrl + Z
+  combos.push_back({503, 203});  // Win + D
+}
+
+void saveSetting(const char* key, uint8_t v) {
+  prefs.begin("mkey", false);
+  prefs.putUChar(key, v);
+  prefs.end();
+}
+
+void loadSettings() {
+  prefs.begin("mkey", false);
+  kpBig     = prefs.getUChar("kpBig", 1) != 0;
+  joyMode   = prefs.getUChar("joyMode", JM_OFF);
+  joyBig    = prefs.getUChar("joyBig", 1) != 0;
+  joyAction = prefs.getUChar("joyAct", JA_WASD);
+  joyOrient = prefs.getUChar("joyOri", 0);
+  prefs.end();
+  if (joyMode > JM_ONLY) joyMode = JM_OFF;
+  if (joyAction > JA_MOUSE) joyAction = JA_WASD;
+  if (joyOrient > 3) joyOrient = 0;
+}
+
+// ------------------------------------------------------------
+// BLE
+// ------------------------------------------------------------
+void advertisePayload(const String& payload) {
   BLEAdvertisementData oData;
   oData.setName("M5Key_Beacon");
   oData.setManufacturerData(payload);
@@ -92,43 +278,258 @@ void sendBleBeacon(std::vector<uint16_t> cmds) {
   pAdvertising->stop();
   pAdvertising->setAdvertisementData(oData);
   pAdvertising->start();
+}
+
+// Tus / kombinasyon paketi: [FF FF][sayac][tus sayisi][kod_lo kod_hi ...]
+void sendBleBeacon(const Keys& cmds) {
+  if (cmds.empty() || cmds.size() > MAX_KEYS) return;
+  seqCounter++;
+
+  String payload = "";
+  payload += (char)0xFF;  // M5Stack ID Low
+  payload += (char)0xFF;  // M5Stack ID High
+  payload += (char)seqCounter;
+  payload += (char)cmds.size();
+
+  for (size_t i = 0; i < cmds.size(); i++) {
+    payload += (char)(cmds[i] & 0xFF);
+    payload += (char)((cmds[i] >> 8) & 0xFF);
+  }
+
+  advertisePayload(payload);
 
   showSignal = true;
   signalTime = millis();
 }
 
+// Joystick durum paketi: [FF FF][sayac][0x80|mod][x][y][sw]  (x,y: -100..100, y yukari +)
+void sendJoyBeacon(uint8_t action, int8_t x, int8_t y, bool sw) {
+  seqCounter++;
+
+  String payload = "";
+  payload += (char)0xFF;
+  payload += (char)0xFF;
+  payload += (char)seqCounter;
+  payload += (char)(0x80 | action);
+  payload += (char)x;
+  payload += (char)y;
+  payload += (char)(sw ? 1 : 0);
+
+  advertisePayload(payload);
+}
+
+// ------------------------------------------------------------
+// Keypad tarama (4x4, pasif satirlar Hi-Z)
+// ------------------------------------------------------------
+uint16_t scanKeypad() {
+  bool big = kpBigEff();
+  uint16_t st = 0;
+  for (int r = 0; r < 4; r++) {
+    pinMode(ROW_PINS[r], OUTPUT);
+    digitalWrite(ROW_PINS[r], LOW);
+    delayMicroseconds(50);
+    for (int c = 0; c < 4; c++) {
+      if (digitalRead(COL_PINS[c]) == LOW) {
+        int idx = big ? (c * 4 + r) : (r * 4 + c);
+        st |= (1 << idx);
+      }
+    }
+    pinMode(ROW_PINS[r], INPUT);
+  }
+  return st;
+}
+
+void onKeypadPress(int k) {
+  if (currentMenu == KP_PLAY && assignTarget < 0) {
+    selectedIndex = k;
+    if (!bindings[k].empty()) sendBleBeacon(bindings[k]);
+    drawUI();
+  } else if (currentMenu == KP_SETTINGS) {
+    selectedIndex = k;
+    drawUI();
+  }
+}
+
+void handleKeypad() {
+  if (!keypadActive()) return;  // Sadece Joystick modunda keypad calismaz
+  static uint16_t lastRaw = 0, stable = 0;
+  static uint32_t lastChange = 0;
+  uint16_t raw = scanKeypad();
+  if (raw != lastRaw) {
+    lastRaw = raw;
+    lastChange = millis();
+  }
+  if (raw != stable && millis() - lastChange > 20) {
+    uint16_t pressed = raw & ~stable;
+    stable = raw;
+    for (int k = 0; k < 16; k++) {
+      if (pressed & (1 << k)) onKeypadPress(k);
+    }
+  }
+}
+
+// ------------------------------------------------------------
+// Joystick
+// ------------------------------------------------------------
+int joyCx = 2048, joyCy = 2048;
+int8_t joyLX = 0, joyLY = 0;
+bool joyLSw = false;
+uint32_t joyLastScan = 0, joyLastSend = 0;
+uint8_t joyNeutralLeft = 0;
+
+void joyConfigurePins() {
+  pinMode(0, INPUT);
+  pinMode(1, INPUT);
+  pinMode(8, INPUT);
+  if (joyActive()) pinMode(joySwPin(), INPUT_PULLUP);  // eksenler analog giris
+}
+
+void joyCalibrate() {
+  if (!joyActive()) return;
+  int px = joyXPin(), py = JOY_PIN_Y;
+  long sx = 0, sy = 0;
+  const int N = 16;
+  for (int i = 0; i < N; i++) {
+    if (joyAdcOk(px)) sx += analogRead(px);
+    if (joyAdcOk(py)) sy += analogRead(py);
+    delay(2);
+  }
+  joyCx = joyAdcOk(px) ? (int)(sx / N) : 2048;
+  joyCy = joyAdcOk(py) ? (int)(sy / N) : 2048;
+}
+
+// -1..1 (olu bolge uygulanmis). ADC pini olmayan eksen 0 doner (sabit sola kaymasin diye).
+float joyAxisNorm(int pin, int center) {
+  if (!joyAdcOk(pin)) return 0;
+  long s = 0;
+  for (int i = 0; i < 4; i++) s += analogRead(pin);
+  float d = (float)((int)(s / 4) - center) / 1900.0f;
+  if (d > 1) d = 1;
+  if (d < -1) d = -1;
+  if (fabsf(d) < JOY_DEADZONE) return 0;
+  return (d > 0) ? (d - JOY_DEADZONE) / (1.0f - JOY_DEADZONE)
+                 : (d + JOY_DEADZONE) / (1.0f - JOY_DEADZONE);
+}
+
+int8_t joyQuant(float v) {  // -100..100, 5'er adim (paket sayisini azaltir)
+  int q = (int)lroundf(v * 100.0f / 5.0f) * 5;
+  if (q > 100) q = 100;
+  if (q < -100) q = -100;
+  return (int8_t)q;
+}
+
+void joyRead(int8_t &ox, int8_t &oy, bool &osw) {
+  // Ham: x saga +, y yukari + (ADC arttikca asagi varsayildi)
+  float rx = joyAxisNorm(joyXPin(), joyCx) * (JOY_INVERT_X ? -1.0f : 1.0f);
+  float ry = -joyAxisNorm(JOY_PIN_Y, joyCy) * (JOY_INVERT_Y ? -1.0f : 1.0f);
+
+  // "Dondur" ayari: secilen fiziksel yon = ileri
+  static const int FX[4] = {0, 0, 1, -1};  // yukari, asagi, sag, sol
+  static const int FY[4] = {1, -1, 0, 0};
+  int fx = FX[joyOrient], fy = FY[joyOrient];
+  float lx = rx * fy - ry * fx;  // mantiksal sag
+  float ly = rx * fx + ry * fy;  // mantiksal ileri
+
+  ox = joyQuant(lx);
+  oy = joyQuant(ly);
+  osw = (digitalRead(joySwPin()) == LOW);
+}
+
+void joyReleaseOutput() {
+  for (int i = 0; i < 3; i++) {
+    sendJoyBeacon(joyAction, 0, 0, false);
+    delay(40);
+  }
+  joyLX = 0; joyLY = 0; joyLSw = false; joyNeutralLeft = 0;
+}
+
+void setJoyMode(uint8_t m) {
+  if (joyActive()) joyReleaseOutput();
+  joyMode = m;
+  saveSetting("joyMode", m);
+  joyConfigurePins();
+  joyCalibrate();
+}
+
+void handleJoystick() {
+  if (!joyActive()) return;
+  uint32_t now = millis();
+  if (now - joyLastScan < 20) return;
+  joyLastScan = now;
+
+  int8_t x, y;
+  bool sw;
+  joyRead(x, y, sw);
+  bool active = (x != 0 || y != 0 || sw);
+  bool changed = (x != joyLX || y != joyLY || sw != joyLSw);
+
+  if (changed) {
+    if (now - joyLastSend >= JOY_MIN_SEND_MS) {
+      sendJoyBeacon(joyAction, x, y, sw);
+      joyLX = x; joyLY = y; joyLSw = sw;
+      joyLastSend = now;
+      joyNeutralLeft = active ? 0 : 3;  // birakinca notr paketi birkac kez tekrarla
+    }
+  } else if (active) {
+    if (now - joyLastSend >= JOY_KEEPALIVE_MS) {
+      sendJoyBeacon(joyAction, x, y, sw);
+      joyLastSend = now;
+    }
+  } else if (joyNeutralLeft > 0 && now - joyLastSend >= 100) {
+    sendJoyBeacon(joyAction, 0, 0, false);
+    joyLastSend = now;
+    joyNeutralLeft--;
+  }
+}
+
+// ------------------------------------------------------------
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
-  
-  M5.Display.setRotation(3); 
+
+  M5.Display.setRotation(3);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
-  
-  // Varsayılan Kombinasyonları Yükle
-  comboNames.push_back("Alt + F4");       comboActions.push_back({{KB_MODIFIERS, 2}, {KB_FUNC, 3}});
-  comboNames.push_back("Alt + Tab");      comboActions.push_back({{KB_MODIFIERS, 2}, {KB_SPECIAL, 1}});
-  comboNames.push_back("Ctrl + C (Kop)"); comboActions.push_back({{KB_MODIFIERS, 0}, {KB_LETTERS, 2}});
-  comboNames.push_back("Ctrl + V (Yap)"); comboActions.push_back({{KB_MODIFIERS, 0}, {KB_LETTERS, 21}});
-  comboNames.push_back("Ctrl + Z (Geri)");comboActions.push_back({{KB_MODIFIERS, 0}, {KB_LETTERS, 25}});
-  comboNames.push_back("Win + D (Masa)"); comboActions.push_back({{KB_MODIFIERS, 3}, {KB_LETTERS, 3}});
-  
+
+  for (int c = 0; c < 4; c++) pinMode(COL_PINS[c], INPUT_PULLUP);
+  for (int r = 0; r < 4; r++) pinMode(ROW_PINS[r], INPUT);
+
+  // Kayitli verileri yukle (ilk acilista varsayilan kombinasyonlar)
+  if (!loadList("combos", combos)) {
+    loadDefaultCombos();
+    saveList("combos", combos);
+  }
+  loadList("seq", sequence);
+  loadBindings();
+  loadSettings();
+  joyConfigurePins();
+  joyCalibrate();
+
   BLEDevice::init("M5Key_Beacon");
   pAdvertising = BLEDevice::getAdvertising();
-  
+  pAdvertising->setMinInterval(0x20);  // 20 ms (joystick gecikmesi icin)
+  pAdvertising->setMaxInterval(0x30);  // 30 ms
+
   drawUI();
 }
 
 void loop() {
   M5.update();
   handleButtons();
+  handleKeypad();
+  handleJoystick();
 
-  // Sinyal yazısını 300ms sonra normale döndür
+  // Sinyal yazisini 300ms sonra normale dondur
   if (showSignal && (millis() - signalTime > 300)) {
     showSignal = false;
     drawUI();
   }
-  
+
   delay(10);
+}
+
+bool isLeafMenu(MenuState m) {
+  return m == MEDIA_MENU || m == KB_LETTERS || m == KB_MODIFIERS ||
+         m == KB_NAV || m == KB_SPECIAL || m == KB_FUNC || m == KP_PLAY;
 }
 
 void handleButtons() {
@@ -136,24 +537,24 @@ void handleButtons() {
     b_press_time = millis();
     b_handled = false;
   }
-  
+
   if (M5.BtnB.isPressed() && !b_handled && (millis() - b_press_time > 400)) {
-    goBack(); 
+    goBack();
     drawUI();
     b_handled = true;
   }
-  
+
   if (M5.BtnB.wasReleased() && !b_handled) {
     b_clicks++;
     b_last_click = millis();
   }
-  
+
   if (b_clicks > 0 && (millis() - b_last_click > 250)) {
-    if (b_clicks == 1) { 
+    if (b_clicks == 1) {
       selectedIndex++;
       if (selectedIndex >= getMenuSize(currentMenu)) selectedIndex = 0;
       drawUI();
-    } else if (b_clicks >= 2) { 
+    } else if (b_clicks >= 2) {
       selectedIndex--;
       if (selectedIndex < 0) selectedIndex = getMenuSize(currentMenu) - 1;
       drawUI();
@@ -162,18 +563,24 @@ void handleButtons() {
   }
 
   if (M5.BtnA.wasPressed()) {
+    a_menu = currentMenu;
     triggerAction(currentMenu, selectedIndex);
     a_last_exec = millis();
+    a_repeat_ms = 500;
     drawUI();
-  } else if (M5.BtnA.isPressed() && (millis() - a_last_exec > 500)) {
+  } else if (M5.BtnA.isPressed() && (millis() - a_last_exec > a_repeat_ms) &&
+             currentMenu == a_menu && isLeafMenu(currentMenu) &&
+             !isRecording && !isComboRecording && assignTarget < 0) {
+    // Basili tutunca tekrar (ses arttirma vb.) - sadece yaprak menulerde
     triggerAction(currentMenu, selectedIndex);
     a_last_exec = millis();
+    a_repeat_ms = 150;
   }
 }
 
 int getMenuSize(MenuState state) {
   switch (state) {
-    case MAIN_MENU: return 2;
+    case MAIN_MENU: return 4;
     case MEDIA_MENU: return 8;
     case KB_MAIN: return 7;
     case KB_LETTERS: return 36;
@@ -181,8 +588,14 @@ int getMenuSize(MenuState state) {
     case KB_NAV: return 9;
     case KB_SPECIAL: return 9;
     case KB_FUNC: return 24;
-    case KB_COMBO: return 1 + comboNames.size(); 
+    case KB_COMBO: return 2 + combos.size();  // + Yeni, kombinasyonlar, Varsayilana Don
     case KB_SEQUENCE: return 4;
+    case KP_MAIN: return 3;                   // Ayarlar, Klavye, Boyut
+    case KP_SETTINGS: return 17;              // S1..S16 + Tumunu Temizle
+    case KP_PLAY: return 16;
+    case JOY_MAIN: return 6;                  // Kapali, Birlikte, Sadece, Boyut, Dondur, Ayarlar
+    case JOY_ACTION: return 4;
+    case JOY_ROTATE: return 1;
   }
   return 0;
 }
@@ -197,26 +610,56 @@ String getMenuItem(MenuState state, int index) {
     case KB_NAV: return kbNav[index];
     case KB_SPECIAL: return kbSpecial[index];
     case KB_FUNC: return kbFunc[index];
-    case KB_COMBO: 
+    case KB_COMBO:
       if (index == 0) return isComboRecording ? "-> Kaydet & Bitir" : "+ Yeni Komb. Ekle";
-      return comboNames[index - 1];
+      if (index <= (int)combos.size()) return keysLabel(combos[index - 1]);
+      return "Varsayilana Don";
     case KB_SEQUENCE: return kbSequence[index];
+    case KP_MAIN:
+      if (index == 2) return String("Boyut: ") + (kpBigEff() ? "Buyuk" : "Kucuk") + (joyMode == JM_BOTH ? " (sabit)" : "");
+      return kpMainItems[index];
+    case KP_SETTINGS:
+      if (index < 16) return "S" + String(index + 1) + " - " + bindingLabel(index);
+      return "Tumunu Temizle";
+    case KP_PLAY:
+      return "S" + String(index + 1) + " - " + bindingLabel(index);
+    case JOY_MAIN:
+      if (index <= 2) return String(joyMode == index ? "* " : "  ") + joyModeNames[index];
+      if (index == 3) return String("Boyut: ") + (joyBigEff() ? "Buyuk" : "Kucuk") + (joyMode == JM_BOTH ? " (sabit)" : "");
+      if (index == 4) return "Dondur";
+      return "Ayarlar";
+    case JOY_ACTION:
+      return String(joyAction == index ? "* " : "  ") + joyActionNames[index];
+    case JOY_ROTATE:
+      return "Yon";
   }
   return "";
 }
 
 void goBack() {
-  if (currentMenu == MAIN_MENU) return;
-  if (currentMenu == MEDIA_MENU || currentMenu == KB_MAIN) currentMenu = MAIN_MENU;
+  if (currentMenu == MAIN_MENU) {
+    // Atama modundaysak iptal et ve ayarlara don
+    if (assignTarget >= 0) {
+      selectedIndex = assignTarget;
+      assignTarget = -1;
+      currentMenu = KP_SETTINGS;
+    }
+    return;
+  }
+  if (currentMenu == MEDIA_MENU || currentMenu == KB_MAIN || currentMenu == KP_MAIN || currentMenu == JOY_MAIN) currentMenu = MAIN_MENU;
+  else if (currentMenu == KP_SETTINGS || currentMenu == KP_PLAY) currentMenu = KP_MAIN;
+  else if (currentMenu == JOY_ACTION || currentMenu == JOY_ROTATE) currentMenu = JOY_MAIN;
   else currentMenu = KB_MAIN;
   selectedIndex = 0;
 }
 
-void showToast(const char* msg) {
-  canvas.fillRoundRect(20, 45, 200, 35, 5, TFT_DARKGREEN);
+void showToast(const String& msg) {
+  canvas.fillRoundRect(10, 45, 220, 35, 5, TFT_DARKGREEN);
   canvas.setTextColor(TFT_WHITE, TFT_DARKGREEN);
   canvas.setTextSize(2);
-  canvas.setCursor(40, 55); 
+  if (canvas.textWidth(msg) > 205) canvas.setTextSize(1.5);
+  int w = canvas.textWidth(msg);
+  canvas.setCursor(max(14, (int)((240 - w) / 2)), 55);
   canvas.print(msg);
   canvas.pushSprite(0, 0);
   delay(300);
@@ -224,84 +667,233 @@ void showToast(const char* msg) {
 }
 
 void triggerAction(MenuState menu, int index) {
-  // SIRA (MAKRO) KAYDEDİLİYORSA
-  if (isRecording && menu != MAIN_MENU && menu != KB_MAIN && menu != KB_SEQUENCE) {
-    sequence.push_back({menu, index});
-    showToast("Siraya Eklendi");
-    return;
+  // 1) KEYPAD TUS ATAMA MODU: secilen oge S tusuna atanir (gonderilmez)
+  if (assignTarget >= 0) {
+    if (menu == KP_PLAY) return;
+    Keys k = keysForItem(menu, index);
+    if (!k.empty()) {
+      int t = assignTarget;
+      bindings[t] = k;
+      saveBindings();
+      assignTarget = -1;
+      currentMenu = KP_SETTINGS;
+      selectedIndex = t;
+      showToast("S" + String(t + 1) + " = " + keysLabel(k));
+      return;
+    }
   }
 
-  // YENİ KOMBİNASYON KAYDEDİLİYORSA
-  if (isComboRecording && menu != MAIN_MENU && menu != KB_MAIN && menu != KB_COMBO) {
-    tempCombo.push_back({menu, index});
-    showToast("Eklendi!");
-    return;
+  // 2) SIRA (MAKRO) KAYDI
+  if (isRecording) {
+    Keys k = keysForItem(menu, index);
+    if (!k.empty()) {
+      if ((int)sequence.size() >= MAX_SEQ) { showToast("Sira dolu!"); return; }
+      sequence.push_back(k);
+      saveList("seq", sequence);
+      showToast("Siraya Eklendi");
+      return;
+    }
   }
 
-  // MENÜ İŞLEMLERİ
+  // 3) YENI KOMBINASYON KAYDI
+  if (isComboRecording && menu != KB_COMBO) {
+    uint16_t code = getCommandCode(menu, index);
+    if (code) {
+      if ((int)tempCombo.size() >= MAX_KEYS) { showToast("En fazla 4 tus"); return; }
+      tempCombo.push_back(code);
+      showToast("Eklendi!");
+      return;
+    }
+  }
+
+  // MENU ISLEMLERI
   if (menu == MAIN_MENU) {
-    currentMenu = (index == 0) ? MEDIA_MENU : KB_MAIN;
+    MenuState targets[] = {MEDIA_MENU, KB_MAIN, KP_MAIN, JOY_MAIN};
+    currentMenu = targets[index];
     selectedIndex = 0;
-  } 
+    if (currentMenu == JOY_MAIN) joyCalibrate();  // menude cubuk serbest -> merkezi tekrar olc
+  }
   else if (menu == KB_MAIN) {
     MenuState targets[] = {KB_LETTERS, KB_MODIFIERS, KB_NAV, KB_SPECIAL, KB_FUNC, KB_COMBO, KB_SEQUENCE};
     currentMenu = targets[index];
     selectedIndex = 0;
-  } 
+  }
+  else if (menu == KP_MAIN) {
+    if (index == 0) { currentMenu = KP_SETTINGS; selectedIndex = 0; }
+    else if (index == 1) { currentMenu = KP_PLAY; selectedIndex = 0; }
+    else {
+      if (joyMode == JM_BOTH) {
+        showToast("Birlikte: Buyuk sabit");
+      } else {
+        kpBig = !kpBig;
+        saveSetting("kpBig", kpBig ? 1 : 0);
+        showToast(String("Keypad: ") + (kpBig ? "Buyuk" : "Kucuk"));
+      }
+    }
+  }
+  else if (menu == KP_SETTINGS) {
+    if (index < 16) {
+      // Atama modunu ac: ana menuye don, bir komut sec
+      assignTarget = index;
+      currentMenu = MAIN_MENU;
+      selectedIndex = 0;
+    } else {
+      for (int i = 0; i < 16; i++) bindings[i].clear();
+      saveBindings();
+      showToast("Hepsi temizlendi");
+    }
+  }
+  else if (menu == KP_PLAY) {
+    if (bindings[index].empty()) showToast("Atanmamis");
+    else sendBleBeacon(bindings[index]);
+  }
   else if (menu == KB_COMBO) {
+    int n = combos.size();
     if (index == 0) {
       if (!isComboRecording) {
         isComboRecording = true;
         tempCombo.clear();
       } else {
         isComboRecording = false;
-        if (tempCombo.size() > 0) {
-          comboActions.push_back(tempCombo);
-          comboNames.push_back("Ozel Komb " + String(comboNames.size() - 5));
+        if (!tempCombo.empty()) {
+          if ((int)combos.size() < MAX_COMBOS) {
+            combos.push_back(tempCombo);
+            saveList("combos", combos);
+            showToast(keysLabel(tempCombo) + " kaydedildi");
+          } else {
+            showToast("Liste dolu!");
+          }
         }
+        tempCombo.clear();
       }
+    } else if (index <= n) {
+      sendBleBeacon(combos[index - 1]);
     } else {
-      // Kombinasyonu Tek Pakette Fırlat (PyAutoGUI Hotkey algılayacak)
-      std::vector<uint16_t> comboCmds;
-      for (auto const& action : comboActions[index - 1]) {
-        comboCmds.push_back(getCommandCode(action.menu, action.index));
-      }
-      sendBleBeacon(comboCmds);
+      loadDefaultCombos();
+      saveList("combos", combos);
+      selectedIndex = 0;
+      showToast("Varsayilana donuldu");
     }
-  } 
+  }
   else if (menu == KB_SEQUENCE) {
-    if (index == 0) { 
-      bool wasRec = isRecording;
-      isRecording = false;
-      for (auto const& action : sequence) {
-        sendBleBeacon({getCommandCode(action.menu, action.index)});
-        delay(150); // Python'un ardışık tuşları kaçırmaması için kısa bekleme
+    if (index == 0) {
+      for (const Keys& step : sequence) {
+        sendBleBeacon(step);
+        delay(150);  // dinleyicinin ardisik tuslari kacirmamasi icin
       }
-      isRecording = wasRec;
     }
     else if (index == 1) { isRecording = true; }
     else if (index == 2) { isRecording = false; }
-    else if (index == 3) { sequence.clear(); }
-  } 
-  else {
-    // Normal Tek Tuş Gönderimi
-    sendBleBeacon({getCommandCode(menu, index)});
+    else if (index == 3) { sequence.clear(); saveList("seq", sequence); }
   }
+  else if (menu == JOY_MAIN) {
+    if (index <= 2) {
+      setJoyMode((uint8_t)index);
+      showToast(String("Joystick: ") + joyModeNames[index]);
+    } else if (index == 3) {
+      if (joyMode == JM_BOTH) {
+        showToast("Birlikte: Buyuk sabit");
+      } else {
+        if (joyActive()) joyReleaseOutput();
+        joyBig = !joyBig;
+        saveSetting("joyBig", joyBig ? 1 : 0);
+        joyConfigurePins();
+        joyCalibrate();
+        if (!joyAdcOk(joyXPin())) showToast("Kucuk: X(G0) ADC yok!");
+        else showToast(String("Joystick: ") + (joyBig ? "Buyuk" : "Kucuk"));
+      }
+    } else if (index == 4) {
+      currentMenu = JOY_ROTATE;
+      selectedIndex = 0;
+    } else {
+      currentMenu = JOY_ACTION;
+      selectedIndex = joyAction;
+    }
+  }
+  else if (menu == JOY_ACTION) {
+    if (joyActive()) joyReleaseOutput();
+    joyAction = (uint8_t)index;
+    saveSetting("joyAct", joyAction);
+    showToast(String("Joy: ") + joyActionNames[index]);
+  }
+  else if (menu == JOY_ROTATE) {
+    joyOrient = (joyOrient + 1) % 4;  // yukari -> asagi -> sag -> sol
+    saveSetting("joyOri", joyOrient);
+  }
+  else {
+    // Normal tek tus gonderimi
+    Keys k = keysForItem(menu, index);
+    if (!k.empty()) sendBleBeacon(k);
+  }
+}
+
+// Metni 225 px icine sigdir (once kucult, sonra kes)
+void printFit(const String& s, int x, int y) {
+  String t = s;
+  canvas.setTextSize(2);
+  if (canvas.textWidth(t) > 225) canvas.setTextSize(1.5);
+  while (t.length() > 3 && canvas.textWidth(t) > 225) t.remove(t.length() - 1);
+  canvas.setCursor(x, y);
+  canvas.print(t);
+}
+
+String getFooter() {
+  String f = "";
+  if (currentMenu == KB_SEQUENCE && !sequence.empty()) {
+    f = "Sira: ";
+    for (size_t i = 0; i < sequence.size(); i++) {
+      if (i) f += ", ";
+      f += keysLabel(sequence[i]);
+    }
+  } else if (currentMenu == KB_COMBO && isComboRecording && !tempCombo.empty()) {
+    f = "Komb: " + keysLabel(tempCombo);
+  }
+  if (f.length() > 26) f = ".." + f.substring(f.length() - 24);
+  return f;
+}
+
+// "Dondur" ekrani: ok = ileri yonu (A ile degisir)
+void drawRotateScreen() {
+  const int cx = 120, cy = 72;
+  static const int DX[4] = {0, 0, 1, -1};   // ekran koordinati: yukari, asagi, sag, sol
+  static const int DY[4] = {-1, 1, 0, 0};
+  int dx = DX[joyOrient], dy = DY[joyOrient];
+  int px = -dy, py = dx;
+
+  // govde
+  for (int t = -5; t <= 5; t++) {
+    canvas.drawLine(cx - dx * 30 + px * t, cy - dy * 30 + py * t,
+                    cx + dx * 5 + px * t,  cy + dy * 5 + py * t, THEME_SEL);
+  }
+  // uc
+  canvas.fillTriangle(cx + dx * 38, cy + dy * 38,
+                      cx + dx * 5 + px * 20, cy + dy * 5 + py * 20,
+                      cx + dx * 5 - px * 20, cy + dy * 5 - py * 20, THEME_SEL);
+
+  canvas.setTextSize(1);
+  canvas.setTextColor(THEME_FG, THEME_BG);
+  canvas.setCursor(5, 24);
+  canvas.print("A: yon degistir");
+
+  canvas.setTextSize(1.5);
+  canvas.setTextColor(TFT_YELLOW, THEME_BG);
+  canvas.setCursor(5, 118);
+  canvas.print(String("Ileri = ") + dirNames[joyOrient]);
 }
 
 void drawUI() {
   canvas.fillScreen(THEME_BG);
-  
+
   canvas.setTextSize(1.5);
   canvas.setTextColor(THEME_FG, THEME_BG);
   canvas.setCursor(5, 5);
-  canvas.print("MKey"); // Yazı MKey olarak güncellendi
-  
-  canvas.setCursor(185, 5);
+  canvas.print("MKey");
+
+  canvas.setCursor(200, 5);
   canvas.printf("%%%d", M5.Power.getBatteryLevel());
-  
-  // Sinyal ve Yayın Durumu
-  canvas.setCursor(75, 5);
+
+  // Sinyal ve Yayin Durumu
+  canvas.setCursor(48, 5);
   if (showSignal) {
     canvas.setTextColor(TFT_YELLOW, THEME_BG);
     canvas.print("[SINYAL!]");
@@ -309,24 +901,31 @@ void drawUI() {
     canvas.setTextColor(TFT_GREEN, THEME_BG);
     canvas.print("[YAYINDA]");
   }
-  
-  if (isRecording || isComboRecording) {
-    canvas.setCursor(145, 5);
+
+  if (isRecording || isComboRecording || assignTarget >= 0) {
+    canvas.setCursor(132, 5);
     canvas.setTextColor(TFT_RED, THEME_BG);
-    canvas.print(" REC");
+    if (assignTarget >= 0) canvas.print("REC S" + String(assignTarget + 1));
+    else canvas.print("REC");
   }
 
   canvas.drawLine(0, 20, 240, 20, THEME_FG);
 
-  canvas.setTextSize(2);
-  int visibleItems = (currentMenu == KB_SEQUENCE && sequence.size() > 0) ? 3 : 4; 
+  if (currentMenu == JOY_ROTATE) {
+    drawRotateScreen();
+    canvas.pushSprite(0, 0);
+    return;
+  }
+
+  String footer = getFooter();
+  int visibleItems = (footer.length() > 0) ? 3 : 4;
   int startIdx = (selectedIndex / visibleItems) * visibleItems;
   int listSize = getMenuSize(currentMenu);
-  
+
   for (int i = 0; i < visibleItems; i++) {
     int itemIdx = startIdx + i;
     if (itemIdx >= listSize) break;
-    
+
     int yPos = 30 + (i * 25);
     if (itemIdx == selectedIndex) {
       canvas.fillRect(0, yPos - 2, 240, 24, THEME_FG);
@@ -334,22 +933,15 @@ void drawUI() {
     } else {
       canvas.setTextColor(THEME_FG, THEME_BG);
     }
-    
-    canvas.setCursor(10, yPos);
-    canvas.print(getMenuItem(currentMenu, itemIdx));
+    printFit(getMenuItem(currentMenu, itemIdx), 10, yPos);
   }
 
-  if (currentMenu == KB_SEQUENCE && sequence.size() > 0) {
+  if (footer.length() > 0) {
     canvas.setTextSize(1.5);
     canvas.setTextColor(TFT_ORANGE, THEME_BG);
-    canvas.setCursor(5, 115); 
-    String seqText = "Sira: ";
-    for (int i = 0; i < sequence.size(); i++) {
-      seqText += getMenuItem(sequence[i].menu, sequence[i].index);
-      if (i < sequence.size() - 1) seqText += ", ";
-    }
-    canvas.print(seqText); 
+    canvas.setCursor(5, 115);
+    canvas.print(footer);
   }
-  
+
   canvas.pushSprite(0, 0);
 }
